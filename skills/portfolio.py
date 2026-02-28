@@ -1,4 +1,4 @@
-from hl_client import logger, wallet_address
+from hl_client import get_wallet_address, logger
 from skills.close_trade import close_position
 from skills.support import get_account_equity_snapshot, get_frontend_open_orders, get_meta_context
 
@@ -9,10 +9,8 @@ def get_portfolio_status() -> dict:
     """
     logger.info("A recolher snapshot do portefólio...")
 
-    if not wallet_address:
-        return {"status": "error", "message": "Cliente não inicializado."}
-
     try:
+        wallet_address = get_wallet_address()
         account_snapshot = get_account_equity_snapshot()
         user_state = account_snapshot["user_state"]
         open_orders = get_frontend_open_orders()

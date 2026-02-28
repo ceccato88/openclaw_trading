@@ -1,4 +1,4 @@
-from hl_client import exchange, logger
+from hl_client import get_exchange, logger
 from skills.support import (
     cancel_orders_for_coin,
     delete_trade_state,
@@ -14,10 +14,8 @@ def close_position(coin: str) -> dict:
     """
     logger.info(f"🚨 A tentar fechar a posição em {coin} a mercado...")
 
-    if not exchange:
-        return {"status": "error", "message": "Clientes não inicializados."}
-
     try:
+        get_exchange()
         position = get_open_position(coin)
         if not position:
             return {"status": "error", "message": f"Não tem nenhuma posição aberta em {coin} para fechar."}

@@ -15,7 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from hl_client import exchange
+from hl_client import get_exchange
 from project_env import load_project_env
 from runtime.cycles import run_heartbeat_cycle, run_hunt_cycle
 from skills.close_trade import close_position
@@ -65,6 +65,25 @@ def _assert_clean_account(snapshot: Dict[str, Any]) -> None:
     _require(snapshot.get("status") == "success", f"Snapshot inválido: {_json(snapshot)}")
     _require(not snapshot.get("positions"), "A smoke test exige conta sem posições abertas.")
     _require(not snapshot.get("open_orders"), "A smoke test exige conta sem ordens abertas.")
+
+
+def _assert_minimum_tradeable_balance(snapshot: Dict[str, Any], required_notional_usd: float, slippage_buffer_pct: float = 1.0) -> None:
+    _require(snapshot.get("status") == "success", f"Snapshot inválido para verificação de saldo: {_json(snapshot)}")
+    available = float(snapshot.get("spot_usdc_available") or snapshot.get("withdrawable") or 0.0)
+    required_balance = required_notional_usd * (1 + (slippage_buffer_pct / 100))
+    _require(
+        available >= required_balance,
+        f"Saldo insuficiente para smoke test. Disponível=${available:.2f} | Necessário>={required_balance:.2f}",
+    )
+
+
+def _record_cleanup_and_assert(summary: Dict[str, Any], label: str, allow_dirty_start: bool) -> None:
+    cleanup_key = f"cleanup_after_{label}"
+    snapshot_key = f"snapshot_after_{label}"
+    summary[cleanup_key] = _cleanup_local_state()
+    summary[snapshot_key] = get_portfolio_status()
+    if not allow_dirty_start:
+        _assert_clean_account(summary[snapshot_key])
 
 
 def _run_scheduler_once(flag: str, env_overrides: Dict[str, str]) -> Dict[str, Any]:
@@ -124,8 +143,8 @@ def _cleanup_local_state() -> Dict[str, Any]:
     return cleanup
 
 
-def _run_direct_market_trade(coin: str, usdt_size: float, leverage: int, risk_pct: float) -> Dict[str, Any]:
-    _require(exchange is not None, "Cliente Exchange não inicializado.")
+def _run_direct_market_trade(coin: str, usdt_size: float, leverage: int, risk_pct: float, reward_pct: float) -> Dict[str, Any]:
+    exchange = get_exchange()
     regime = get_market_regime()
     if regime["regime"] == "BULL":
         side = "LONG"
@@ -137,6 +156,9 @@ def _run_direct_market_trade(coin: str, usdt_size: float, leverage: int, risk_pc
     is_buy = side == "LONG"
     current_price, asset_info, _ = get_asset_context(coin)
     effective_usdt_size = max(usdt_size, MIN_PERP_TRADE_NOTIONAL_USD + SMOKE_NOTIONAL_BUFFER_USD)
+    pre_trade_snapshot = get_portfolio_status()
+    _assert_clean_account(pre_trade_snapshot)
+    _assert_minimum_tradeable_balance(pre_trade_snapshot, effective_usdt_size)
     size_in_coins = round(effective_usdt_size / current_price, int(asset_info["szDecimals"]))
     _require(size_in_coins > 0, f"Tamanho arredondado ficou zero para {coin}.")
 
@@ -148,7 +170,6 @@ def _run_direct_market_trade(coin: str, usdt_size: float, leverage: int, risk_pc
         exchange.market_open(coin, is_buy, size_in_coins, slippage=0.01),
         f"market_open smoke {coin}",
     )
-    reward_pct = risk_pct * 2.0
     protection_prices = compute_protection_prices(
         coin=coin,
         entry_price=fill["avg_px"],
@@ -189,6 +210,8 @@ def _run_direct_market_trade(coin: str, usdt_size: float, leverage: int, risk_pc
         "side": side,
         "requested_usdt_size": usdt_size,
         "effective_usdt_size": effective_usdt_size,
+        "reward_pct": reward_pct,
+        "pre_trade_snapshot": pre_trade_snapshot,
         "leverage_response": leverage_response,
         "fill": fill,
         "protection": protection,
@@ -206,6 +229,8 @@ def main() -> None:
     parser.add_argument("--usdt-size", type=float, default=10.0)
     parser.add_argument("--leverage", type=int, default=10)
     parser.add_argument("--risk-pct", type=float, default=2.0)
+    parser.add_argument("--reward-pct", type=float, default=4.0)
+    parser.add_argument("--account-risk-pct", type=float, default=1.0)
     parser.add_argument("--allow-dirty-start", action="store_true")
     args = parser.parse_args()
 
@@ -216,12 +241,15 @@ def main() -> None:
         "usdt_size": args.usdt_size,
         "leverage": args.leverage,
         "risk_pct": args.risk_pct,
+        "reward_pct": args.reward_pct,
+        "account_risk_pct": args.account_risk_pct,
     }
 
     scheduler_env = {
         "WOLF_POSITION_USD": str(args.usdt_size),
         "WOLF_LEVERAGE": str(args.leverage),
         "WOLF_RISK_PCT": str(args.risk_pct),
+        "WOLF_ACCOUNT_RISK_PCT": str(args.account_risk_pct),
         "WOLF_MIN_VOLUME": os.getenv("WOLF_MIN_VOLUME", "1000000"),
         "WOLF_MAX_RESULTS": os.getenv("WOLF_MAX_RESULTS", "3"),
     }
@@ -237,16 +265,17 @@ def main() -> None:
         summary["heartbeat_direct"] = run_heartbeat_cycle()
         summary["scheduler_heartbeat_once"] = _run_scheduler_once("--heartbeat-once", scheduler_env)
         summary["scheduler_hunt_once"] = _run_scheduler_once("--hunt-once", scheduler_env)
-        summary["cleanup_after_scheduler"] = _cleanup_local_state()
+        _record_cleanup_and_assert(summary, "scheduler", args.allow_dirty_start)
 
         summary["hunt_direct"] = run_hunt_cycle(
             position_usd=args.usdt_size,
             leverage=args.leverage,
             risk_pct=args.risk_pct,
+            account_risk_pct=args.account_risk_pct,
             min_volume=1_000_000,
             max_results=3,
         )
-        summary["cleanup_after_hunt"] = _cleanup_local_state()
+        _record_cleanup_and_assert(summary, "hunt", args.allow_dirty_start)
 
         regime = get_market_regime()
         summary["strategy_attempt"] = execute_wolf_strategy_trade(
@@ -255,15 +284,17 @@ def main() -> None:
             usdt_size=args.usdt_size,
             leverage=args.leverage,
             risk_pct=args.risk_pct,
+            account_risk_pct=args.account_risk_pct,
         )
         summary["reconcile_after_strategy"] = reconcile_pending_entries()
-        summary["cleanup_after_strategy"] = _cleanup_local_state()
+        _record_cleanup_and_assert(summary, "strategy", args.allow_dirty_start)
 
         summary["direct_market_trade"] = _run_direct_market_trade(
             coin=args.coin,
             usdt_size=args.usdt_size,
             leverage=args.leverage,
             risk_pct=args.risk_pct,
+            reward_pct=args.reward_pct,
         )
 
         summary["final_cleanup"] = _cleanup_local_state()

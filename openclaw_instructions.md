@@ -21,8 +21,8 @@ Funções Python que devem ser expostas ao agente:
 - `skills.scanner.run_opportunity_scanner(min_volume=5_000_000, max_results=3)`
   Uso: procurar oportunidades com regime BTC, score multi-fator, funding contrarian, divergência RSI, timing de entrada e heat de portfólio.
 
-- `skills.wolf_strategy.execute_wolf_strategy_trade(coin, side, usdt_size, leverage=10, risk_pct=2.0)`
-  Uso: abrir posição nova com ordem limit, validação de regime, drawdown diário, heat e proteção automática.
+- `skills.wolf_strategy.execute_wolf_strategy_trade(coin, side, usdt_size, leverage=10, risk_pct=2.0, account_risk_pct=1.0)`
+  Uso: abrir posição nova com ordem limit, sizing por risco da conta, validação de regime, drawdown diário, heat e proteção automática.
 
 - `skills.entry_manager.reconcile_pending_entries()`
   Uso: verificar se uma ordem limit pendente virou posição e, se virou, plantar proteção.

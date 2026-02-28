@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-from hl_client import info, logger
+from hl_client import get_info, logger
 from skills.support import with_retry
 
 INTERVAL_TO_MS = {
@@ -22,7 +22,24 @@ INTERVAL_TO_MS = {
 
 REGIME_CACHE_TTL_SECONDS = 300
 DEFAULT_REGIME_LOOKBACK = 400
-MIN_DIRECTIONAL_CONVICTION = 0.15
+REGIME_CONFIRMATION_CANDLES = 3
+REGIME_EMA50_DEADBAND_PCT = 0.002
+MIN_DIRECTIONAL_CONVICTION = 0.25
+MIN_SIGNAL_ATR_PCT = 0.0025
+ATR_QUALITY_CAP_PCT = 0.015
+MAX_ENTRY_ATR_PCT = 0.02
+HIGHER_TIMEFRAME_LEVEL_LOOKBACK = 24
+HIGHER_TIMEFRAME_LEVEL_BUFFER_PCT = 0.003
+TRAILING_BREAKEVEN_PROGRESS = 0.50
+TRAILING_PROFIT_LOCK_50_PROGRESS = 0.80
+TRAILING_PROFIT_LOCK_75_PROGRESS = 0.95
+TRAILING_PROGRESS_EPSILON = 1e-9
+SCORE_WEIGHTS = {
+    "volume": 0.25,
+    "structure": 0.20,
+    "funding": 0.35,
+    "divergence": 0.20,
+}
 _REGIME_CACHE: Dict[tuple[str, str, int], Dict[str, Any]] = {}
 
 
@@ -40,9 +57,7 @@ def fetch_candles(
     lookback: int = 60,
     end_time_ms: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    if not info:
-        raise RuntimeError("Cliente Info não inicializado.")
-
+    info = get_info()
     if interval not in INTERVAL_TO_MS:
         raise ValueError(f"Intervalo {interval} não suportado.")
 
@@ -130,7 +145,7 @@ def calculate_rsi(values: Sequence[float], period: int = 14) -> List[float]:
     return rsi_values
 
 
-def calculate_vfi(candles: Sequence[Dict[str, Any]]) -> float:
+def calculate_signed_volume_ratio(candles: Sequence[Dict[str, Any]]) -> float:
     if not candles:
         return 0.0
 
@@ -206,11 +221,26 @@ def trend_structure(highs: Sequence[float], lows: Sequence[float], n: int = 5) -
     return 0
 
 
-def funding_signal(funding_rate: float, threshold: float = 0.001) -> Dict[str, Any]:
+def funding_signal(
+    funding_rate: float,
+    regime: str,
+    structure_bias: int,
+    threshold: float = 0.001,
+) -> Dict[str, Any]:
+    if abs(funding_rate) < threshold:
+        return {"bias": 0, "label": "NEUTRAL"}
+
+    regime = regime.upper()
     if funding_rate < -threshold:
-        return {"bias": 1, "label": "LONG_SQUEEZE_RISK"}
+        if regime == "BULL" and structure_bias >= 0:
+            return {"bias": 1, "label": "BULL_REGIME_NEGATIVE_FUNDING"}
+        return {"bias": 0, "label": "NEGATIVE_FUNDING_IGNORED"}
+
     if funding_rate > threshold:
-        return {"bias": -1, "label": "SHORT_SQUEEZE_RISK"}
+        if regime == "BEAR" and structure_bias <= 0:
+            return {"bias": -1, "label": "BEAR_REGIME_POSITIVE_FUNDING"}
+        return {"bias": 0, "label": "POSITIVE_FUNDING_IGNORED"}
+
     return {"bias": 0, "label": "NEUTRAL"}
 
 
@@ -228,34 +258,84 @@ def rsi_divergence(prices: Sequence[float], rsi_values: Sequence[float], lookbac
     return {"bias": 0, "label": "NONE"}
 
 
-def determine_market_regime_from_prices(prices: Sequence[float]) -> Dict[str, Any]:
-    if len(prices) < 200:
-        return {"regime": "CHOP", "reason": "insufficient_history"}
+def _classify_regime_point(current_price: float, ema_50: float, ema_200: float, deadband_pct: float) -> str:
+    if current_price > (ema_50 * (1 + deadband_pct)) and ema_50 > ema_200:
+        return "BULL"
+    if current_price < (ema_50 * (1 - deadband_pct)) and ema_50 < ema_200:
+        return "BEAR"
+    return "CHOP"
 
-    ema_50 = calculate_ema(prices, 50)[-1]
-    ema_200 = calculate_ema(prices, 200)[-1]
-    current_price = float(prices[-1])
 
-    if current_price > ema_50 > ema_200:
+def determine_market_regime_from_prices(
+    prices: Sequence[float],
+    confirm_candles: int = REGIME_CONFIRMATION_CANDLES,
+    deadband_pct: float = REGIME_EMA50_DEADBAND_PCT,
+) -> Dict[str, Any]:
+    minimum_history = max(200, 200 + max(confirm_candles - 1, 0))
+    if len(prices) < minimum_history:
+        return {
+            "regime": "CHOP",
+            "reason": "insufficient_history",
+            "required_history": minimum_history,
+            "available_history": len(prices),
+        }
+
+    normalized_prices = [float(price) for price in prices]
+    ema_50_series = calculate_ema(normalized_prices, 50)
+    ema_200_series = calculate_ema(normalized_prices, 200)
+    start_idx = len(normalized_prices) - confirm_candles
+    confirmations: List[Dict[str, float | str | int]] = []
+
+    for idx in range(start_idx, len(normalized_prices)):
+        current_price = normalized_prices[idx]
+        ema_50 = float(ema_50_series[idx])
+        ema_200 = float(ema_200_series[idx])
+        point_regime = _classify_regime_point(current_price, ema_50, ema_200, deadband_pct)
+        confirmations.append(
+            {
+                "index": idx,
+                "price": current_price,
+                "ema_50": ema_50,
+                "ema_200": ema_200,
+                "regime": point_regime,
+            }
+        )
+
+    confirmation_labels = [str(item["regime"]) for item in confirmations]
+    if all(label == "BULL" for label in confirmation_labels):
         regime = "BULL"
-    elif current_price < ema_50 < ema_200:
+    elif all(label == "BEAR" for label in confirmation_labels):
         regime = "BEAR"
     else:
         regime = "CHOP"
 
+    latest = confirmations[-1]
     return {
         "regime": regime,
-        "current_price": current_price,
-        "ema_50": ema_50,
-        "ema_200": ema_200,
+        "current_price": float(latest["price"]),
+        "ema_50": float(latest["ema_50"]),
+        "ema_200": float(latest["ema_200"]),
+        "confirm_candles": confirm_candles,
+        "deadband_pct": deadband_pct * 100,
+        "confirmation_path": confirmation_labels,
     }
 
 
 def _compute_market_regime(coin: str = "BTC", interval: str = "1h", lookback: int = DEFAULT_REGIME_LOOKBACK) -> Dict[str, Any]:
     candles = fetch_candles(coin, interval=interval, lookback=lookback)
-    closes = candle_closes(candles)
+    candles_for_regime = candles[:-1] if len(candles) > 1 else candles
+    closes = candle_closes(candles_for_regime)
     regime = determine_market_regime_from_prices(closes)
-    regime.update({"coin": coin, "interval": interval, "candles": len(candles)})
+    regime.update(
+        {
+            "coin": coin,
+            "interval": interval,
+            "candles": len(candles_for_regime),
+            "raw_candles": len(candles),
+            "used_closed_candle": len(candles_for_regime) != len(candles),
+            "last_closed_at": candles_for_regime[-1]["t"] if candles_for_regime else None,
+        }
+    )
     return regime
 
 
@@ -275,6 +355,7 @@ def evaluate_pullback_entry_from_candles(
     direction: str,
     candles: Sequence[Dict[str, Any]],
     proximity_threshold: Optional[float] = None,
+    max_atr_pct: float = MAX_ENTRY_ATR_PCT,
 ) -> Dict[str, Any]:
     if len(candles) < 22:
         return {"triggered": False, "reason": "insufficient_candles"}
@@ -285,19 +366,40 @@ def evaluate_pullback_entry_from_candles(
     current_price = closes[-1]
     previous_close = closes[-2]
     current_open = opens[-1]
+    previous_open = opens[-2]
+    atr_pct = calculate_atr_pct(candles, period=14)
     if proximity_threshold is None:
-        proximity_threshold = clamp(max(calculate_atr_pct(candles, period=14) * 0.5, 0.003), 0.003, 0.02)
+        proximity_threshold = clamp(max(atr_pct * 0.5, 0.003), 0.003, 0.02)
+
+    if atr_pct > max_atr_pct:
+        return {
+            "triggered": False,
+            "reason": "atr_expansion_filter",
+            "ema21": ema21,
+            "current_price": current_price,
+            "atr_pct": atr_pct * 100,
+            "max_atr_pct": max_atr_pct * 100,
+            "proximity_threshold_pct": proximity_threshold * 100,
+        }
 
     distance_pct = abs(current_price - ema21) / ema21 if ema21 else 1.0
     near_ema = distance_pct <= proximity_threshold
 
     direction = direction.upper()
     if direction == "LONG":
-        confirmation = current_price > current_open and current_price >= previous_close
+        confirmation = (
+            current_price > current_open
+            and previous_close > previous_open
+            and current_price >= previous_close
+        )
         limit_price = min(current_price, ema21)
     else:
-        confirmation = current_price < current_open and current_price <= previous_close
-        limit_price = current_price
+        confirmation = (
+            current_price < current_open
+            and previous_close < previous_open
+            and current_price <= previous_close
+        )
+        limit_price = max(current_price, ema21)
 
     triggered = near_ema and confirmation
     return {
@@ -305,10 +407,63 @@ def evaluate_pullback_entry_from_candles(
         "reason": "ok" if triggered else "waiting_pullback_confirmation",
         "ema21": ema21,
         "current_price": current_price,
+        "atr_pct": atr_pct * 100,
+        "max_atr_pct": max_atr_pct * 100,
         "distance_to_ema_pct": distance_pct * 100,
         "confirmation_candle": confirmation,
+        "confirmation_window": 2,
         "entry_limit_price": limit_price,
         "proximity_threshold_pct": proximity_threshold * 100,
+    }
+
+
+def evaluate_higher_timeframe_context_from_candles(
+    direction: str,
+    candles: Sequence[Dict[str, Any]],
+    level_lookback: int = HIGHER_TIMEFRAME_LEVEL_LOOKBACK,
+    level_buffer_pct: float = HIGHER_TIMEFRAME_LEVEL_BUFFER_PCT,
+) -> Dict[str, Any]:
+    if len(candles) < max(50, level_lookback + 1):
+        return {"context_ok": False, "reason": "insufficient_higher_timeframe_candles"}
+
+    closes = candle_closes(candles)
+    highs = candle_highs(candles)
+    lows = candle_lows(candles)
+    ema50 = calculate_ema(closes, 50)[-1]
+    ema200 = calculate_ema(closes, 200)[-1] if len(closes) >= 200 else calculate_ema(closes, len(closes))[-1]
+    current_price = closes[-1]
+    recent_high = max(highs[-level_lookback:])
+    recent_low = min(lows[-level_lookback:])
+    direction = direction.upper()
+
+    if direction == "LONG":
+        trend_ok = current_price >= ema50 and ema50 >= ema200
+        resistance_distance_pct = max((recent_high - current_price) / current_price, 0.0) if current_price else 0.0
+        level_ok = resistance_distance_pct > level_buffer_pct
+        reason = "ok" if trend_ok and level_ok else "higher_timeframe_trend_filter" if not trend_ok else "near_higher_timeframe_resistance"
+        nearest_level_distance_pct = resistance_distance_pct * 100
+        nearest_level = recent_high
+    else:
+        trend_ok = current_price <= ema50 and ema50 <= ema200
+        support_distance_pct = max((current_price - recent_low) / current_price, 0.0) if current_price else 0.0
+        level_ok = support_distance_pct > level_buffer_pct
+        reason = "ok" if trend_ok and level_ok else "higher_timeframe_trend_filter" if not trend_ok else "near_higher_timeframe_support"
+        nearest_level_distance_pct = support_distance_pct * 100
+        nearest_level = recent_low
+
+    return {
+        "context_ok": trend_ok and level_ok,
+        "reason": reason,
+        "timeframe": "1h",
+        "current_price": current_price,
+        "ema50": ema50,
+        "ema200": ema200,
+        "trend_ok": trend_ok,
+        "level_ok": level_ok,
+        "nearest_level": nearest_level,
+        "nearest_level_distance_pct": nearest_level_distance_pct,
+        "level_buffer_pct": level_buffer_pct * 100,
+        "level_lookback_candles": level_lookback,
     }
 
 
@@ -318,9 +473,23 @@ def evaluate_pullback_entry(
     interval: str = "15m",
     lookback: int = 40,
     proximity_threshold: Optional[float] = None,
+    max_atr_pct: float = MAX_ENTRY_ATR_PCT,
 ) -> Dict[str, Any]:
     candles = fetch_candles(coin, interval=interval, lookback=lookback)
-    result = evaluate_pullback_entry_from_candles(direction, candles, proximity_threshold=proximity_threshold)
+    result = evaluate_pullback_entry_from_candles(
+        direction,
+        candles,
+        proximity_threshold=proximity_threshold,
+        max_atr_pct=max_atr_pct,
+    )
+    higher_timeframe_candles = fetch_candles(coin, interval="1h", lookback=max(120, HIGHER_TIMEFRAME_LEVEL_LOOKBACK + 10))
+    context = evaluate_higher_timeframe_context_from_candles(direction, higher_timeframe_candles)
+    result["higher_timeframe_context"] = context
+    result["triggered"] = bool(result.get("triggered")) and bool(context.get("context_ok"))
+    if result["triggered"]:
+        result["reason"] = "ok"
+    elif result.get("reason") == "ok":
+        result["reason"] = context.get("reason", "higher_timeframe_context_filter")
     result.update({"coin": coin, "interval": interval})
     return result
 
@@ -331,6 +500,7 @@ def calculate_dynamic_stop_price(
     take_profit: float,
     is_long: bool,
     original_stop: float,
+    atr_buffer: float = 0.0,
 ) -> Dict[str, Any]:
     total_distance = abs(take_profit - entry)
     if total_distance == 0:
@@ -347,11 +517,15 @@ def calculate_dynamic_stop_price(
 
     progress = clamp(progress, 0.0, 1.5)
 
-    if progress < 0.33:
+    if progress < (TRAILING_BREAKEVEN_PROGRESS - TRAILING_PROGRESS_EPSILON):
         return {"stop_price": original_stop, "progress": progress, "stage": "initial_risk"}
-    if progress < 0.66:
-        return {"stop_price": entry, "progress": progress, "stage": "breakeven"}
-    if progress < 0.85:
+    if progress < (TRAILING_PROFIT_LOCK_50_PROGRESS - TRAILING_PROGRESS_EPSILON):
+        if is_long:
+            buffered_stop = max(original_stop, entry - max(atr_buffer, 0.0))
+        else:
+            buffered_stop = min(original_stop, entry + max(atr_buffer, 0.0))
+        return {"stop_price": buffered_stop, "progress": progress, "stage": "breakeven_buffer"}
+    if progress < (TRAILING_PROFIT_LOCK_75_PROGRESS - TRAILING_PROGRESS_EPSILON):
         return {"stop_price": lock_50, "progress": progress, "stage": "profit_lock_50"}
     return {"stop_price": lock_75, "progress": progress, "stage": "profit_lock_75"}
 
@@ -367,16 +541,31 @@ def score_opportunity(
     closes = candle_closes(candles)
     highs = candle_highs(candles)
     lows = candle_lows(candles)
+    atr_pct = calculate_atr_pct(candles, period=14)
     rsi_values = calculate_rsi(closes, period=14)
-    vfi = calculate_vfi(candles)
+    signed_volume_ratio = calculate_signed_volume_ratio(candles)
     structure_bias = trend_structure(highs, lows)
-    funding = funding_signal(funding_rate)
+    funding = funding_signal(funding_rate, regime=regime, structure_bias=structure_bias)
     divergence = rsi_divergence(closes, rsi_values)
     price = closes[-1]
     price_change_pct = ((price - prev_day_px) / prev_day_px) * 100 if prev_day_px > 0 else 0.0
 
-    vfi_bias = 1 if vfi > 0.05 else -1 if vfi < -0.05 else 0
-    directional_score = (vfi_bias * 0.30) + (structure_bias * 0.30) + (funding["bias"] * 0.20) + (divergence["bias"] * 0.20)
+    if atr_pct < MIN_SIGNAL_ATR_PCT:
+        return {
+            "coin": coin,
+            "rejected": True,
+            "reason": "atr_compression_filter",
+            "atr_pct": round(atr_pct * 100, 4),
+            "min_atr_pct": MIN_SIGNAL_ATR_PCT * 100,
+        }
+
+    volume_bias = 1 if signed_volume_ratio > 0.05 else -1 if signed_volume_ratio < -0.05 else 0
+    directional_score = (
+        (volume_bias * SCORE_WEIGHTS["volume"])
+        + (structure_bias * SCORE_WEIGHTS["structure"])
+        + (funding["bias"] * SCORE_WEIGHTS["funding"])
+        + (divergence["bias"] * SCORE_WEIGHTS["divergence"])
+    )
 
     if regime == "BULL" and directional_score < MIN_DIRECTIONAL_CONVICTION:
         return {"coin": coin, "rejected": True, "reason": "regime_filter_bull_weak_signal"}
@@ -386,8 +575,9 @@ def score_opportunity(
         return {"coin": coin, "rejected": True, "reason": "regime_filter_chop"}
 
     suggested_side = "LONG" if directional_score > 0 else "SHORT"
-    confidence = abs(directional_score) * 100
-    rating = "FORTE" if confidence >= 60 else "MEDIO" if confidence >= 30 else "FRACO"
+    atr_quality = clamp((atr_pct - MIN_SIGNAL_ATR_PCT) / (ATR_QUALITY_CAP_PCT - MIN_SIGNAL_ATR_PCT), 0.0, 1.0)
+    score_strength = abs(directional_score) * (0.85 + (atr_quality * 0.15)) * 100
+    rating = "FORTE" if score_strength >= 60 else "MEDIO" if score_strength >= 30 else "FRACO"
 
     return {
         "coin": coin,
@@ -395,14 +585,18 @@ def score_opportunity(
         "volume_24h_usd": round(volume_24h, 2),
         "change_24h_pct": round(price_change_pct, 2),
         "funding_rate": funding_rate,
-        "score": round(confidence, 2),
+        "score": round(score_strength, 2),
+        "score_strength": round(score_strength, 2),
         "rating": rating,
         "directional_score": round(directional_score, 4),
         "min_conviction": MIN_DIRECTIONAL_CONVICTION,
+        "atr_pct": round(atr_pct * 100, 4),
+        "min_atr_pct": MIN_SIGNAL_ATR_PCT * 100,
+        "atr_quality": round(atr_quality, 4),
         "suggested_side": suggested_side,
         "signals": {
-            "vfi": round(vfi, 4),
-            "vfi_bias": vfi_bias,
+            "signed_volume_ratio": round(signed_volume_ratio, 4),
+            "volume_bias": volume_bias,
             "structure_bias": structure_bias,
             "funding_signal": funding["label"],
             "funding_bias": funding["bias"],

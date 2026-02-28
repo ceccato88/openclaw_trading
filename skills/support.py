@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hl_client import exchange, info, logger, wallet_address
+from hl_client import get_exchange, get_info, get_wallet_address, logger, refresh_hl_client
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATE_DIR = BASE_DIR / "state"
@@ -18,6 +18,24 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY_SECONDS = 1.0
 LOCK_STALE_SECONDS = 900
 MIN_PERP_TRADE_NOTIONAL_USD = 10.0
+CORRELATION_GROUPS = {
+    "BTC": "majors",
+    "ETH": "majors",
+    "SOL": "majors",
+    "BNB": "majors",
+    "AVAX": "majors",
+    "SUI": "majors",
+    "ARB": "beta_l2",
+    "OP": "beta_l2",
+    "STRK": "beta_l2",
+    "TIA": "beta_l1",
+    "SEI": "beta_l1",
+    "APT": "beta_l1",
+    "WIF": "memes",
+    "PEPE": "memes",
+    "BONK": "memes",
+    "DOGE": "memes",
+}
 
 
 def ensure_state_dirs() -> None:
@@ -56,6 +74,10 @@ def with_retry(
             if attempt >= retries:
                 break
             sleep_for = delay_seconds * (2 ** (attempt - 1))
+            try:
+                refresh_hl_client()
+            except Exception as refresh_error:  # noqa: BLE001
+                logger.warning("Falha ao refrescar clientes Hyperliquid após erro em %s: %s", action_label, refresh_error)
             logger.warning(
                 f"{action_label} falhou na tentativa {attempt}/{retries}: {exc}. Novo retry em {sleep_for:.1f}s."
             )
@@ -84,6 +106,17 @@ def release_file_lock(lock_path: Optional[Path]) -> None:
         lock_path.unlink()
 
 
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(path)
+    return path
+
+
 def load_trade_state(coin: str) -> Optional[Dict[str, Any]]:
     path = trade_state_path(coin)
     if not path.exists():
@@ -94,16 +127,12 @@ def load_trade_state(coin: str) -> Optional[Dict[str, Any]]:
 
 def save_trade_state(coin: str, payload: Dict[str, Any]) -> Path:
     path = trade_state_path(coin)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-    return path
+    return atomic_write_json(path, payload)
 
 
 def save_pending_entry_state(coin: str, payload: Dict[str, Any]) -> Path:
     path = pending_entry_state_path(coin)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-    return path
+    return atomic_write_json(path, payload)
 
 
 def delete_trade_state(coin: str) -> None:
@@ -166,14 +195,14 @@ def ensure_exchange_ok(response: Optional[Dict[str, Any]], action_label: str) ->
 
 
 def get_user_state() -> Dict[str, Any]:
-    if not info or not wallet_address:
-        raise RuntimeError("Cliente Info não inicializado.")
+    info = get_info()
+    wallet_address = get_wallet_address()
     return with_retry(lambda: info.user_state(wallet_address), action_label="user_state")
 
 
 def get_account_mode() -> str:
-    if not info or not wallet_address:
-        raise RuntimeError("Cliente Info não inicializado.")
+    info = get_info()
+    wallet_address = get_wallet_address()
     raw_mode = with_retry(
         lambda: info.query_user_abstraction_state(wallet_address),
         action_label="query_user_abstraction_state",
@@ -186,8 +215,8 @@ def get_account_mode() -> str:
 
 
 def get_spot_user_state() -> Dict[str, Any]:
-    if not info or not wallet_address:
-        raise RuntimeError("Cliente Info não inicializado.")
+    info = get_info()
+    wallet_address = get_wallet_address()
     return with_retry(lambda: info.spot_user_state(wallet_address), action_label="spot_user_state")
 
 
@@ -284,8 +313,7 @@ def extract_fill_details(response: Dict[str, Any], action_label: str) -> Dict[st
 
 
 def get_meta_context() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if not info:
-        raise RuntimeError("Cliente Info não inicializado.")
+    info = get_info()
     meta, asset_contexts = with_retry(info.meta_and_asset_ctxs, action_label="meta_and_asset_ctxs")
     return meta["universe"], asset_contexts
 
@@ -307,11 +335,9 @@ def get_asset_context(coin: str) -> Tuple[float, Dict[str, Any], Dict[str, Any]]
 
 def round_price_for_order(coin: str, price: float) -> float:
     rounded_significant = float(f"{price:.5g}")
-    if not exchange:
-        return rounded_significant
-
-    asset = exchange.info.name_to_asset(coin)
-    decimals = (6 if asset < 10_000 else 8) - exchange.info.asset_to_sz_decimals[asset]
+    _current_price, asset_info, _asset_context = get_asset_context(coin)
+    sz_decimals = int(asset_info["szDecimals"])
+    decimals = 6 - sz_decimals
     return round(rounded_significant, max(decimals, 0))
 
 
@@ -335,6 +361,24 @@ def compute_protection_prices(
     }
 
 
+def calculate_risk_based_notional(
+    equity: float,
+    risk_budget_pct: float,
+    stop_distance_pct: float,
+    minimum_notional_usd: float = MIN_PERP_TRADE_NOTIONAL_USD,
+) -> float:
+    if equity <= 0:
+        raise ValueError("Equity inválida para cálculo de posição.")
+    if risk_budget_pct <= 0:
+        raise ValueError("risk_budget_pct deve ser maior que zero.")
+    if stop_distance_pct <= 0:
+        raise ValueError("stop_distance_pct deve ser maior que zero.")
+
+    max_loss_usd = equity * (risk_budget_pct / 100)
+    notional = max_loss_usd / (stop_distance_pct / 100)
+    return max(notional, minimum_notional_usd)
+
+
 def validate_perp_order_notional(
     coin: str,
     size: float,
@@ -350,9 +394,83 @@ def validate_perp_order_notional(
     return None
 
 
+def is_protection_order(order: Dict[str, Any]) -> bool:
+    order_type = str(order.get("orderType") or "").strip().lower()
+    has_reduce_only = bool(order.get("reduceOnly"))
+    has_position_tpsl_flag = bool(order.get("isPositionTpsl"))
+    has_trigger_flag = bool(order.get("isTrigger"))
+    has_trigger_price = order.get("triggerPx") is not None
+    looks_like_tpsl_type = any(
+        token in order_type
+        for token in ("stop", "take profit", "tpsl")
+    )
+
+    return any(
+        (
+            has_reduce_only,
+            has_position_tpsl_flag,
+            has_trigger_flag,
+            has_trigger_price,
+            looks_like_tpsl_type,
+        )
+    )
+
+
+def protection_order_kind(order: Dict[str, Any]) -> Optional[str]:
+    if not is_protection_order(order):
+        return None
+
+    order_type = str(order.get("orderType") or "").strip().lower()
+    if "take profit" in order_type:
+        return "tp"
+    if "stop" in order_type:
+        return "sl"
+    return None
+
+
+def get_active_protection_levels(coin: str) -> Dict[str, Any]:
+    protection_orders = []
+    sl_price: Optional[float] = None
+    tp_price: Optional[float] = None
+    sl_order: Optional[Dict[str, Any]] = None
+    tp_order: Optional[Dict[str, Any]] = None
+
+    for order in get_frontend_open_orders(coin):
+        if not is_protection_order(order):
+            continue
+
+        trigger_price_raw = order.get("triggerPx")
+        limit_price_raw = order.get("limitPx")
+        price = None
+        if trigger_price_raw is not None:
+            price = float(trigger_price_raw)
+        elif limit_price_raw is not None:
+            price = float(limit_price_raw)
+
+        kind = protection_order_kind(order)
+        if kind == "sl" and price is not None:
+            sl_price = price
+            sl_order = order
+        elif kind == "tp" and price is not None:
+            tp_price = price
+            tp_order = order
+
+        protection_orders.append(order)
+
+    return {
+        "coin": coin,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "sl_order": sl_order,
+        "tp_order": tp_order,
+        "orders": protection_orders,
+    }
+
+
 def cancel_orders_for_coin(coin: str, only_reduce_only: bool = False) -> List[int]:
-    if not info or not exchange or not wallet_address:
-        raise RuntimeError("Clientes Hyperliquid não inicializados.")
+    get_info()
+    exchange = get_exchange()
+    get_wallet_address()
 
     canceled_oids: List[int] = []
     seen_oids = set()
@@ -367,8 +485,7 @@ def cancel_orders_for_coin(coin: str, only_reduce_only: bool = False) -> List[in
             continue
 
         if only_reduce_only:
-            is_protection = bool(order.get("reduceOnly") or order.get("isPositionTpsl") or order.get("isTrigger"))
-            if not is_protection:
+            if not is_protection_order(order):
                 continue
 
         seen_oids.add(oid)
@@ -396,9 +513,8 @@ def cancel_orders_for_coin(coin: str, only_reduce_only: bool = False) -> List[in
 
 
 def get_frontend_open_orders(coin: Optional[str] = None) -> List[Dict[str, Any]]:
-    if not info or not wallet_address:
-        raise RuntimeError("Clientes Hyperliquid não inicializados.")
-
+    info = get_info()
+    wallet_address = get_wallet_address()
     orders = with_retry(lambda: info.frontend_open_orders(wallet_address), action_label="frontend_open_orders")
     if coin is None:
         return orders
@@ -406,9 +522,7 @@ def get_frontend_open_orders(coin: Optional[str] = None) -> List[Dict[str, Any]]
 
 
 def _submit_trigger_order(coin: str, exit_is_buy: bool, size: float, trigger_price: float, tpsl: str) -> Dict[str, Any]:
-    if not exchange:
-        raise RuntimeError("Cliente Exchange não inicializado.")
-
+    exchange = get_exchange()
     rounded_price = round_price_for_order(coin, trigger_price)
     response = with_retry(
         lambda: exchange.order(
@@ -431,6 +545,38 @@ def _submit_trigger_order(coin: str, exit_is_buy: bool, size: float, trigger_pri
     }
 
 
+def _modify_trigger_order(
+    oid: int,
+    coin: str,
+    exit_is_buy: bool,
+    size: float,
+    trigger_price: float,
+    tpsl: str,
+) -> Dict[str, Any]:
+    exchange = get_exchange()
+    rounded_price = round_price_for_order(coin, trigger_price)
+    response = with_retry(
+        lambda: exchange.modify_order(
+            oid,
+            coin,
+            exit_is_buy,
+            size,
+            rounded_price,
+            {"trigger": {"isMarket": True, "triggerPx": rounded_price, "tpsl": tpsl}},
+            reduce_only=True,
+        ),
+        action_label=f"modificar ordem de proteção {tpsl.upper()} para {coin}",
+    )
+    status = ensure_exchange_ok(response, f"modificar ordem de proteção {tpsl.upper()} para {coin}")
+    resting = status.get("resting", {}) if status else {}
+    return {
+        "price": rounded_price,
+        "oid": resting.get("oid", oid),
+        "response": response,
+        "status": status,
+    }
+
+
 def place_trade_protection(coin: str, is_long: bool, size: float, stop_loss_price: float, take_profit_price: float) -> Dict[str, Any]:
     exit_is_buy = not is_long
     stop_order = _submit_trigger_order(coin, exit_is_buy, size, stop_loss_price, "sl")
@@ -438,10 +584,34 @@ def place_trade_protection(coin: str, is_long: bool, size: float, stop_loss_pric
     return {"sl": stop_order, "tp": take_profit_order}
 
 
-def place_limit_entry_order(coin: str, is_buy: bool, size: float, limit_price: float) -> Dict[str, Any]:
-    if not exchange:
-        raise RuntimeError("Cliente Exchange não inicializado.")
+def upsert_trade_protection(
+    coin: str,
+    is_long: bool,
+    size: float,
+    stop_loss_price: float,
+    take_profit_price: float,
+    active_protection: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    active_protection = active_protection or get_active_protection_levels(coin)
+    exit_is_buy = not is_long
+    sl_order = active_protection.get("sl_order")
+    tp_order = active_protection.get("tp_order")
 
+    if sl_order and sl_order.get("oid") is not None:
+        stop_result = _modify_trigger_order(int(sl_order["oid"]), coin, exit_is_buy, size, stop_loss_price, "sl")
+    else:
+        stop_result = _submit_trigger_order(coin, exit_is_buy, size, stop_loss_price, "sl")
+
+    if tp_order and tp_order.get("oid") is not None:
+        tp_result = _modify_trigger_order(int(tp_order["oid"]), coin, exit_is_buy, size, take_profit_price, "tp")
+    else:
+        tp_result = _submit_trigger_order(coin, exit_is_buy, size, take_profit_price, "tp")
+
+    return {"sl": stop_result, "tp": tp_result}
+
+
+def place_limit_entry_order(coin: str, is_buy: bool, size: float, limit_price: float) -> Dict[str, Any]:
+    exchange = get_exchange()
     rounded_price = round_price_for_order(coin, limit_price)
     response = with_retry(
         lambda: exchange.order(coin, is_buy, size, rounded_price, {"limit": {"tif": "Gtc"}}, reduce_only=False),
@@ -471,16 +641,14 @@ def get_open_positions() -> List[Dict[str, Any]]:
 
 
 def market_close_position(coin: str, size: Optional[float] = None) -> Dict[str, Any]:
-    if not exchange:
-        raise RuntimeError("Cliente Exchange não inicializado.")
+    exchange = get_exchange()
     if size is None:
         return with_retry(lambda: exchange.market_close(coin), action_label=f"market_close {coin}")
     return with_retry(lambda: exchange.market_close(coin, sz=size), action_label=f"market_close {coin}")
 
 
 def update_exchange_leverage(leverage: int, coin: str, is_cross: bool) -> Dict[str, Any]:
-    if not exchange:
-        raise RuntimeError("Cliente Exchange não inicializado.")
+    exchange = get_exchange()
     return with_retry(
         lambda: exchange.update_leverage(leverage, coin, is_cross=is_cross),
         action_label=f"update_leverage {coin}",
@@ -492,12 +660,20 @@ def estimate_position_risk(
     trade_state: Optional[Dict[str, Any]] = None,
     default_risk_pct: float = 2.0,
 ) -> float:
+    coin = str(position.get("coin", ""))
     size = abs(float(position["szi"]))
     entry_price = float(position["entryPx"]) if position.get("entryPx") is not None else 0.0
     position_value = abs(float(position.get("positionValue", 0.0)))
 
-    if trade_state and trade_state.get("sl") is not None and trade_state.get("entry") is not None:
-        return abs(float(trade_state["entry"]) - float(trade_state["sl"])) * size
+    if coin:
+        active_protection = get_active_protection_levels(coin)
+        active_stop = active_protection.get("sl_price")
+        if active_stop is not None and entry_price > 0:
+            return abs(entry_price - float(active_stop)) * size
+
+    if trade_state and trade_state.get("sl") is not None:
+        state_entry = float(trade_state.get("entry", entry_price) or entry_price)
+        return abs(state_entry - float(trade_state["sl"])) * size
 
     if entry_price > 0:
         stop_distance = entry_price * (default_risk_pct / 100)
@@ -530,17 +706,21 @@ def has_pending_entry(coin: str) -> bool:
     return load_pending_entry_state(coin) is not None
 
 
+def correlation_group_for_coin(coin: str) -> str:
+    normalized = str(coin).upper()
+    return CORRELATION_GROUPS.get(normalized, normalized)
+
+
 def check_portfolio_heat(
+    new_coin: Optional[str] = None,
     new_side: Optional[str] = None,
     planned_entry: Optional[float] = None,
     planned_size: Optional[float] = None,
     planned_stop: Optional[float] = None,
     max_total_risk_pct: float = 6.0,
     max_positions_per_side: int = 2,
+    max_correlated_positions_per_side: int = 1,
 ) -> Dict[str, Any]:
-    if not info or not wallet_address:
-        return {"can_trade": False, "message": "Cliente não inicializado."}
-
     account_snapshot = get_account_equity_snapshot()
     equity = account_snapshot["tradeable_equity"]
     open_positions = get_open_positions()
@@ -551,6 +731,9 @@ def check_portfolio_heat(
     total_pending_risk = sum(estimate_pending_entry_risk(pending) for pending in pending_entries)
     long_exposure = sum(1 for position in open_positions if float(position["szi"]) > 0)
     short_exposure = sum(1 for position in open_positions if float(position["szi"]) < 0)
+    correlated_long_exposure = 0
+    correlated_short_exposure = 0
+    new_group = correlation_group_for_coin(new_coin) if new_coin else None
 
     for pending in pending_entries:
         pending_side = pending.get("side")
@@ -558,6 +741,26 @@ def check_portfolio_heat(
             long_exposure += 1
         elif pending_side == "SHORT":
             short_exposure += 1
+
+    if new_group:
+        correlated_long_exposure = sum(
+            1
+            for position in open_positions
+            if float(position["szi"]) > 0 and correlation_group_for_coin(position["coin"]) == new_group
+        )
+        correlated_short_exposure = sum(
+            1
+            for position in open_positions
+            if float(position["szi"]) < 0 and correlation_group_for_coin(position["coin"]) == new_group
+        )
+        for pending in pending_entries:
+            pending_coin = pending.get("coin")
+            if not pending_coin or correlation_group_for_coin(pending_coin) != new_group:
+                continue
+            if pending.get("side") == "LONG":
+                correlated_long_exposure += 1
+            elif pending.get("side") == "SHORT":
+                correlated_short_exposure += 1
 
     new_risk = 0.0
     if planned_entry is not None and planned_size is not None and planned_stop is not None:
@@ -596,6 +799,42 @@ def check_portfolio_heat(
             "short_exposure": short_exposure,
         }
 
+    if new_group and new_side == "LONG" and correlated_long_exposure >= max_correlated_positions_per_side:
+        return {
+            "can_trade": False,
+            "message": f"Exposição correlacionada LONG no grupo {new_group} no máximo.",
+            "account_mode": account_snapshot["account_mode"],
+            "equity": equity,
+            "total_open_risk": total_open_risk,
+            "total_pending_risk": total_pending_risk,
+            "planned_risk": new_risk,
+            "total_risk_after": total_risk_after,
+            "max_allowed_risk": max_allowed_risk,
+            "long_exposure": long_exposure,
+            "short_exposure": short_exposure,
+            "correlation_group": new_group,
+            "correlated_long_exposure": correlated_long_exposure,
+            "correlated_short_exposure": correlated_short_exposure,
+        }
+
+    if new_group and new_side == "SHORT" and correlated_short_exposure >= max_correlated_positions_per_side:
+        return {
+            "can_trade": False,
+            "message": f"Exposição correlacionada SHORT no grupo {new_group} no máximo.",
+            "account_mode": account_snapshot["account_mode"],
+            "equity": equity,
+            "total_open_risk": total_open_risk,
+            "total_pending_risk": total_pending_risk,
+            "planned_risk": new_risk,
+            "total_risk_after": total_risk_after,
+            "max_allowed_risk": max_allowed_risk,
+            "long_exposure": long_exposure,
+            "short_exposure": short_exposure,
+            "correlation_group": new_group,
+            "correlated_long_exposure": correlated_long_exposure,
+            "correlated_short_exposure": correlated_short_exposure,
+        }
+
     if total_risk_after >= max_allowed_risk:
         return {
             "can_trade": False,
@@ -609,6 +848,9 @@ def check_portfolio_heat(
             "max_allowed_risk": max_allowed_risk,
             "long_exposure": long_exposure,
             "short_exposure": short_exposure,
+            "correlation_group": new_group,
+            "correlated_long_exposure": correlated_long_exposure,
+            "correlated_short_exposure": correlated_short_exposure,
         }
 
     return {
@@ -623,4 +865,7 @@ def check_portfolio_heat(
         "max_allowed_risk": max_allowed_risk,
         "long_exposure": long_exposure,
         "short_exposure": short_exposure,
+        "correlation_group": new_group,
+        "correlated_long_exposure": correlated_long_exposure,
+        "correlated_short_exposure": correlated_short_exposure,
     }

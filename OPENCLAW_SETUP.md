@@ -40,7 +40,7 @@ Para rodar o smoke test completo sem lembrar o comando do Python:
 ```bash
 cd /home/ceccato88/projects/TRADING/openclaw
 chmod +x run_smoke.sh
-./run_smoke.sh --coin BTC --usdt-size 10 --leverage 10 --risk-pct 2
+./run_smoke.sh --coin BTC --usdt-size 10 --leverage 10 --risk-pct 2 --reward-pct 4 --account-risk-pct 1
 ```
 
 ## Variáveis de ambiente
@@ -53,9 +53,13 @@ HYPERLIQUID_TESTNET=true
 HYPERLIQUID_ACCOUNT_ADDRESS=0xYOUR_ACCOUNT_ADDRESS
 WOLF_HEARTBEAT_INTERVAL_SECONDS=180
 WOLF_HUNT_INTERVAL_SECONDS=900
+# piso mínimo de notional; o sizing real usa risco da conta
 WOLF_POSITION_USD=25
 WOLF_LEVERAGE=10
+# distância do stop
 WOLF_RISK_PCT=2
+# risco da conta por trade
+WOLF_ACCOUNT_RISK_PCT=1
 WOLF_MIN_VOLUME=5000000
 WOLF_MAX_RESULTS=3
 ```
@@ -111,13 +115,13 @@ Ele valida:
 Execução:
 
 ```bash
-python scripts/smoke_test_openclaw.py --coin BTC --usdt-size 10 --leverage 10 --risk-pct 2
+python scripts/smoke_test_openclaw.py --coin BTC --usdt-size 10 --leverage 10 --risk-pct 2 --reward-pct 4 --account-risk-pct 1
 ```
 
 Ou com o wrapper:
 
 ```bash
-./run_smoke.sh --coin BTC --usdt-size 10 --leverage 10 --risk-pct 2
+./run_smoke.sh --coin BTC --usdt-size 10 --leverage 10 --risk-pct 2 --reward-pct 4 --account-risk-pct 1
 ```
 
 Se a conta já estiver suja:
@@ -125,3 +129,10 @@ Se a conta já estiver suja:
 ```bash
 python scripts/smoke_test_openclaw.py --allow-dirty-start
 ```
+
+Parâmetros principais do smoke:
+
+- `--risk-pct`: distância do stop em percentagem
+- `--reward-pct`: distância do take profit em percentagem
+- `--account-risk-pct`: percentagem do equity arriscada no sizing
+- `--usdt-size`: piso mínimo de notional do teste

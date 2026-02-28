@@ -1,26 +1,37 @@
-from hl_client import exchange, logger
+from hl_client import get_exchange, logger
 from skills.signals import evaluate_pullback_entry, get_market_regime
 from skills.risk_manager import check_daily_drawdown
 from skills.support import (
+    acquire_file_lock,
+    calculate_risk_based_notional,
     cancel_orders_for_coin,
     check_portfolio_heat,
     compute_protection_prices,
     delete_pending_entry_state,
     ensure_exchange_ok,
     extract_fill_details,
+    get_account_equity_snapshot,
     get_asset_context,
     get_open_position,
     has_pending_entry,
     market_close_position,
     place_limit_entry_order,
     place_trade_protection,
+    release_file_lock,
     save_pending_entry_state,
     save_trade_state,
     update_exchange_leverage,
     validate_perp_order_notional,
 )
 
-def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage: int = 10, risk_pct: float = 2.0) -> dict:
+def execute_wolf_strategy_trade(
+    coin: str,
+    side: str,
+    usdt_size: float,
+    leverage: int = 10,
+    risk_pct: float = 2.0,
+    account_risk_pct: float = 1.0,
+) -> dict:
     """
     Skill OpenClaw: Abre a posição e configura automaticamente o Stop Loss e o Take Profit (Relação 2:1).
     """
@@ -37,6 +48,9 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
     if risk_pct <= 0:
         return {"status": "error", "message": "O risco percentual deve ser maior do que zero."}
 
+    if account_risk_pct <= 0:
+        return {"status": "error", "message": "O risco de conta percentual deve ser maior do que zero."}
+
     is_buy = normalized_side == 'LONG'
     
     # 1. Verifica se já não perdemos 10% hoje
@@ -44,12 +58,22 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
     if not risk_check["can_trade"]:
         return {"status": "blocked", "message": risk_check["message"]}
 
-    logger.info(f"A iniciar Trade: {normalized_side} em {coin} | Tamanho: ${usdt_size} | Alavancagem: {leverage}x | Risco: {risk_pct}%")
+    logger.info(
+        "A iniciar Trade: %s em %s | Notional mínimo: $%s | Alavancagem: %sx | Stop: %s%% | Risco da conta: %s%%",
+        normalized_side,
+        coin,
+        usdt_size,
+        leverage,
+        risk_pct,
+        account_risk_pct,
+    )
 
-    if not exchange:
-        return {"status": "error", "message": "Clientes não inicializados"}
+    lock_path = acquire_file_lock(f"wolf-strategy-{coin}")
+    if lock_path is None:
+        return {"status": "blocked", "message": f"Execução concorrente detetada para {coin}. Tente novamente no próximo ciclo."}
 
     try:
+        get_exchange()
         market_regime = get_market_regime()
         if market_regime["regime"] == "CHOP":
             return {"status": "blocked", "message": "Mercado em CHOP. Sem novas entradas."}
@@ -89,11 +113,22 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
             is_long=is_buy,
         )
         planned_stop = planned_protection["sl"]
+        stop_distance_pct = abs(planned_entry_price - planned_stop) / planned_entry_price * 100 if planned_entry_price > 0 else 0.0
+        account_snapshot = get_account_equity_snapshot()
+        tradeable_equity = float(account_snapshot["tradeable_equity"])
 
         leverage_response = update_exchange_leverage(leverage, coin, is_cross=is_cross)
         ensure_exchange_ok(leverage_response, f"ajuste de alavancagem para {coin}")
 
-        size_in_coins = usdt_size / current_price
+        planned_notional_usd = max(
+            usdt_size,
+            calculate_risk_based_notional(
+                equity=tradeable_equity,
+                risk_budget_pct=account_risk_pct,
+                stop_distance_pct=stop_distance_pct,
+            ),
+        )
+        size_in_coins = planned_notional_usd / planned_entry_price
         size_formatted = round(size_in_coins, sz_decimals)
         
         if size_formatted == 0:
@@ -104,6 +139,7 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
             return {"status": "error", "message": notional_error}
 
         heat_check = check_portfolio_heat(
+            new_coin=coin,
             new_side=normalized_side,
             planned_entry=planned_entry_price,
             planned_size=size_formatted,
@@ -127,8 +163,10 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
                 "entry_oid": entry_oid,
                 "entry_limit_price": order_result["price"],
                 "planned_size": size_formatted,
+                "planned_notional_usd": planned_notional_usd,
                 "planned_stop": planned_stop,
                 "risk_pct": risk_pct,
+                "account_risk_pct": account_risk_pct,
                 "reward_pct": reward_pct,
                 "leverage": leverage,
             })
@@ -139,6 +177,7 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
                 "entry_oid": entry_oid,
                 "entry_limit_price": order_result["price"],
                 "planned_size": size_formatted,
+                "planned_notional_usd": planned_notional_usd,
             }
 
         logger.info("✅ Posição aberta com sucesso via limit order. A calcular os alvos (2:1)...")
@@ -146,6 +185,17 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
         fill = extract_fill_details(order_res, f"ordem de entrada de {coin}")
         entry_price = fill["avg_px"]
         filled_size = fill["size"]
+        save_trade_state(coin, {
+            "coin": coin,
+            "entry": entry_price,
+            "filled_size": filled_size,
+            "risk_pct": risk_pct,
+            "account_risk_pct": account_risk_pct,
+            "reward_pct": reward_pct,
+            "breakeven_done": False,
+            "management_stage": "filled_awaiting_protection",
+            "status": "filled_awaiting_protection",
+        })
         protection_prices = compute_protection_prices(
             coin=coin,
             entry_price=entry_price,
@@ -190,9 +240,11 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
             "tp": protection["tp"]["price"],
             "sl": protection["sl"]["price"],
             "risk_pct": risk_pct,
+            "account_risk_pct": account_risk_pct,
             "reward_pct": reward_pct,
             "breakeven_done": False,
             "management_stage": "initial_risk",
+            "status": "protected",
         })
         delete_pending_entry_state(coin)
 
@@ -206,8 +258,12 @@ def execute_wolf_strategy_trade(coin: str, side: str, usdt_size: float, leverage
             "protection": protection,
             "entry_setup": entry_setup,
             "portfolio_heat": heat_check,
+            "planned_notional_usd": planned_notional_usd,
+            "account_risk_pct": account_risk_pct,
         }
 
     except Exception as e:
         logger.error(f"Erro na execução da estratégia: {e}")
         return {"status": "error", "message": str(e)}
+    finally:
+        release_file_lock(lock_path)
