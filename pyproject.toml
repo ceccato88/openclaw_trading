@@ -1,0 +1,15 @@
+[project]
+name = "wolf-openclaw-runtime"
+version = "0.1.0"
+description = "Minimal OpenClaw-compatible Hyperliquid trading runtime."
+readme = "OPENCLAW_SETUP.md"
+requires-python = ">=3.12"
+dependencies = [
+  "eth-account",
+  "hyperliquid-python-sdk",
+  "python-dotenv",
+  "requests",
+]
+
+[tool.uv]
+package = false
