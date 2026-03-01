@@ -1,6 +1,7 @@
 from hl_client import get_exchange, logger
 from skills.support import (
     cancel_orders_for_coin,
+    delete_pending_entry_state,
     delete_trade_state,
     extract_fill_details,
     get_open_position,
@@ -25,6 +26,7 @@ def close_position(coin: str) -> dict:
 
         resultado = market_close_position(coin)
         fill = extract_fill_details(resultado, f"fecho a mercado de {coin}")
+        delete_pending_entry_state(coin)
         delete_trade_state(coin)
 
         logger.info(f"✅ Posição em {coin} fechada com sucesso!")

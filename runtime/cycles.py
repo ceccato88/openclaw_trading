@@ -17,7 +17,7 @@ def run_heartbeat_cycle() -> Dict[str, Any]:
     reconcile_result = reconcile_pending_entries()
     trade_state_reconcile_result = reconcile_trade_states()
     trailing_result = run_dynamic_stop_loss()
-    risk_result = check_daily_drawdown(max_drawdown_pct=10.0)
+    risk_result = check_daily_drawdown()
     portfolio_result = get_portfolio_status()
 
     status = "success"
@@ -52,10 +52,11 @@ def run_hunt_cycle(
     leverage: int = 10,
     risk_pct: float = 2.0,
     account_risk_pct: float = 1.0,
+    reward_pct: float | None = None,
     min_volume: float = 5_000_000,
     max_results: int = 3,
 ) -> Dict[str, Any]:
-    risk_result = check_daily_drawdown(max_drawdown_pct=10.0)
+    risk_result = check_daily_drawdown()
     if not risk_result["can_trade"]:
         result = {"status": "blocked", "message": risk_result["message"], "risk": risk_result}
         record_cycle_result("hunt", result)
@@ -175,6 +176,7 @@ def run_hunt_cycle(
         leverage=leverage,
         risk_pct=risk_pct,
         account_risk_pct=account_risk_pct,
+        reward_pct=reward_pct,
     )
     result = {
         "status": trade_result.get("status", "unknown"),

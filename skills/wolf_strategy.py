@@ -31,6 +31,7 @@ def execute_wolf_strategy_trade(
     leverage: int = 10,
     risk_pct: float = 2.0,
     account_risk_pct: float = 1.0,
+    reward_pct: float | None = None,
 ) -> dict:
     """
     Skill OpenClaw: Abre a posição e configura automaticamente o Stop Loss e o Take Profit (Relação 2:1).
@@ -51,10 +52,13 @@ def execute_wolf_strategy_trade(
     if account_risk_pct <= 0:
         return {"status": "error", "message": "O risco de conta percentual deve ser maior do que zero."}
 
+    if reward_pct is not None and reward_pct <= 0:
+        return {"status": "error", "message": "O reward percentual deve ser maior do que zero."}
+
     is_buy = normalized_side == 'LONG'
     
-    # 1. Verifica se já não perdemos 10% hoje
-    risk_check = check_daily_drawdown(max_drawdown_pct=10.0)
+    # 1. Verifica o drawdown diário antes de entrar na secção crítica protegida por lock.
+    risk_check = check_daily_drawdown()
     if not risk_check["can_trade"]:
         return {"status": "blocked", "message": risk_check["message"]}
 
@@ -104,7 +108,7 @@ def execute_wolf_strategy_trade(
             return {"status": "waiting_entry", "message": "Setup ainda não confirmou pullback na EMA21.", "entry_setup": entry_setup}
 
         planned_entry_price = float(entry_setup["entry_limit_price"])
-        reward_pct = risk_pct * 2.0
+        reward_pct = reward_pct if reward_pct is not None else risk_pct * 2.0
         planned_protection = compute_protection_prices(
             coin=coin,
             entry_price=planned_entry_price,

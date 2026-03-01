@@ -54,7 +54,9 @@ class SchedulerConfig:
     position_usd: float = 25.0
     leverage: int = 10
     risk_pct: float = 2.0
+    reward_pct: float = 4.0
     account_risk_pct: float = 1.0
+    max_drawdown_pct: float = 10.0
     min_volume: float = 5_000_000
     max_results: int = 3
     max_consecutive_failures: int = 3
@@ -93,7 +95,9 @@ def load_scheduler_config() -> SchedulerConfig:
         position_usd=_config_float("WOLF_POSITION_USD", 25.0),
         leverage=_config_int("WOLF_LEVERAGE", 10),
         risk_pct=_config_float("WOLF_RISK_PCT", 2.0),
+        reward_pct=_config_float("WOLF_REWARD_PCT", 4.0),
         account_risk_pct=_config_float("WOLF_ACCOUNT_RISK_PCT", 1.0),
+        max_drawdown_pct=_config_float("WOLF_MAX_DRAWDOWN_PCT", 10.0),
         min_volume=_config_float("WOLF_MIN_VOLUME", 5_000_000),
         max_results=_config_int("WOLF_MAX_RESULTS", 3),
         max_consecutive_failures=_config_int("WOLF_MAX_CONSECUTIVE_FAILURES", 3),
@@ -122,11 +126,13 @@ def _run_heartbeat() -> Dict[str, Any]:
 
 def _run_hunt(config: SchedulerConfig) -> Dict[str, Any]:
     logger.info(
-        "A correr hunt | min_notional_usd=%s leverage=%sx stop_pct=%s account_risk_pct=%s min_volume=%s max_results=%s",
+        "A correr hunt | min_notional_usd=%s leverage=%sx stop_pct=%s reward_pct=%s account_risk_pct=%s max_drawdown_pct=%s min_volume=%s max_results=%s",
         config.position_usd,
         config.leverage,
         config.risk_pct,
+        config.reward_pct,
         config.account_risk_pct,
+        config.max_drawdown_pct,
         config.min_volume,
         config.max_results,
     )
@@ -134,6 +140,7 @@ def _run_hunt(config: SchedulerConfig) -> Dict[str, Any]:
         position_usd=config.position_usd,
         leverage=config.leverage,
         risk_pct=config.risk_pct,
+        reward_pct=config.reward_pct,
         account_risk_pct=config.account_risk_pct,
         min_volume=config.min_volume,
         max_results=config.max_results,
@@ -193,13 +200,15 @@ def _run_loop() -> None:
     config = load_scheduler_config()
     logger.info("Scheduler OpenClaw inicializado.")
     logger.info(
-        "Configuração | heartbeat=%ss hunt=%ss min_notional_usd=%s leverage=%sx stop_pct=%s account_risk_pct=%s",
+        "Configuração | heartbeat=%ss hunt=%ss min_notional_usd=%s leverage=%sx stop_pct=%s reward_pct=%s account_risk_pct=%s max_drawdown_pct=%s",
         config.heartbeat_interval_seconds,
         config.hunt_interval_seconds,
         config.position_usd,
         config.leverage,
         config.risk_pct,
+        config.reward_pct,
         config.account_risk_pct,
+        config.max_drawdown_pct,
     )
 
     scheduler_lock = acquire_file_lock(SCHEDULER_LOCK_NAME)

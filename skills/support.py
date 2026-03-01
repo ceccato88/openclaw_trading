@@ -44,6 +44,13 @@ def ensure_state_dirs() -> None:
     LOCKS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def get_env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value == "":
+        return default
+    return float(raw_value)
+
+
 def trade_state_path(coin: str) -> Path:
     ensure_state_dirs()
     return TRADES_DIR / f"{coin}.json"

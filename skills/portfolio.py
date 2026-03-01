@@ -1,6 +1,12 @@
 from hl_client import get_wallet_address, logger
 from skills.close_trade import close_position
-from skills.support import get_account_equity_snapshot, get_frontend_open_orders, get_meta_context
+from skills.support import (
+    delete_pending_entry_state,
+    get_account_equity_snapshot,
+    get_frontend_open_orders,
+    get_meta_context,
+    list_pending_entry_states,
+)
 
 
 def get_portfolio_status() -> dict:
@@ -68,6 +74,7 @@ def get_portfolio_status() -> dict:
             "total_margin_used": float(margin_summary["totalMarginUsed"]),
             "total_notional_position": float(margin_summary["totalNtlPos"]),
             "withdrawable": account_snapshot["withdrawable"],
+            "pending_entries_count": len(list_pending_entry_states()),
             "positions": positions,
             "open_orders": formatted_orders,
         }
@@ -94,6 +101,7 @@ def close_all_positions() -> dict:
     had_error = False
 
     for position in positions:
+        delete_pending_entry_state(position["coin"])
         result = close_position(position["coin"])
         if result.get("status") != "success":
             had_error = True

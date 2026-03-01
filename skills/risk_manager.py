@@ -8,9 +8,12 @@ from skills.support import (
     acquire_file_lock,
     atomic_write_json,
     ensure_state_dirs,
+    get_env_float,
     get_account_equity_snapshot,
     release_file_lock,
 )
+
+DEFAULT_MAX_DRAWDOWN_PCT = 10.0
 
 
 def _acquire_daily_risk_lock(timeout_seconds: float = 5.0, poll_interval_seconds: float = 0.1):
@@ -39,11 +42,17 @@ def _compute_drawdown_equity(account_snapshot: dict) -> tuple[float, float]:
     return reported_equity, drawdown_equity
 
 
-def check_daily_drawdown(max_drawdown_pct: float = 10.0) -> dict:
+def get_max_drawdown_pct() -> float:
+    return get_env_float("WOLF_MAX_DRAWDOWN_PCT", DEFAULT_MAX_DRAWDOWN_PCT)
+
+
+def check_daily_drawdown(max_drawdown_pct: float | None = None) -> dict:
     """
     Skill de Uso Interno: Verifica se a conta atingiu o limite de perda diária.
     """
     try:
+        if max_drawdown_pct is None:
+            max_drawdown_pct = get_max_drawdown_pct()
         lock_path = _acquire_daily_risk_lock()
         account_snapshot = get_account_equity_snapshot()
         current_equity, drawdown_equity = _compute_drawdown_equity(account_snapshot)
@@ -75,6 +84,7 @@ def check_daily_drawdown(max_drawdown_pct: float = 10.0) -> dict:
                 drawdown_pct = ((start_balance - drawdown_equity) / start_balance) * 100
             else:
                 drawdown_pct = 0.0
+            remaining_risk_budget_pct = max(max_drawdown_pct - drawdown_pct, 0.0)
 
             logger.info(f"Risco Diário: Drawdown atual é de {drawdown_pct:.2f}% (Limite: {max_drawdown_pct}%)")
 
@@ -88,6 +98,7 @@ def check_daily_drawdown(max_drawdown_pct: float = 10.0) -> dict:
                     "drawdown_equity": drawdown_equity,
                     "start_balance": start_balance,
                     "drawdown_pct": drawdown_pct,
+                    "remaining_risk_budget_pct": remaining_risk_budget_pct,
                 }
 
             return {
@@ -98,6 +109,7 @@ def check_daily_drawdown(max_drawdown_pct: float = 10.0) -> dict:
                 "drawdown_equity": drawdown_equity,
                 "start_balance": start_balance,
                 "drawdown_pct": drawdown_pct,
+                "remaining_risk_budget_pct": remaining_risk_budget_pct,
             }
         finally:
             release_file_lock(lock_path)

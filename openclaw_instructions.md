@@ -21,7 +21,7 @@ Funções Python que devem ser expostas ao agente:
 - `skills.scanner.run_opportunity_scanner(min_volume=5_000_000, max_results=3)`
   Uso: procurar oportunidades com regime BTC, score multi-fator, funding contrarian, divergência RSI, timing de entrada e heat de portfólio.
 
-- `skills.wolf_strategy.execute_wolf_strategy_trade(coin, side, usdt_size, leverage=10, risk_pct=2.0, account_risk_pct=1.0)`
+- `skills.wolf_strategy.execute_wolf_strategy_trade(coin, side, usdt_size, leverage=10, risk_pct=2.0, account_risk_pct=1.0, reward_pct=None)`
   Uso: abrir posição nova com ordem limit, sizing por risco da conta, validação de regime, drawdown diário, heat e proteção automática.
 
 - `skills.entry_manager.reconcile_pending_entries()`
@@ -30,7 +30,7 @@ Funções Python que devem ser expostas ao agente:
 - `skills.dsl.run_dynamic_stop_loss()`
   Uso: mover o stop das posições abertas por estágios de progresso até o TP.
 
-- `skills.risk_manager.check_daily_drawdown(max_drawdown_pct=10.0)`
+- `skills.risk_manager.check_daily_drawdown(max_drawdown_pct=None)`
   Uso: verificar se novas entradas devem ser bloqueadas no dia.
 
 - `skills.close_trade.close_position(coin)`
@@ -93,6 +93,7 @@ Variáveis de ambiente mínimas:
 - `HYPERLIQUID_PRIVATE_KEY`
 - `HYPERLIQUID_TESTNET`
 - `HYPERLIQUID_ACCOUNT_ADDRESS` quando usar API wallet
+- `WOLF_MAX_DRAWDOWN_PCT` para o bloqueio diário
 
 Arquivos mínimos que precisam estar disponíveis:
 

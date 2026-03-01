@@ -58,8 +58,11 @@ WOLF_POSITION_USD=25
 WOLF_LEVERAGE=10
 # distância do stop
 WOLF_RISK_PCT=2
+# distância do take profit; se omitido na chamada direta da strategy, usa 2x o stop
+WOLF_REWARD_PCT=4
 # risco da conta por trade
 WOLF_ACCOUNT_RISK_PCT=1
+WOLF_MAX_DRAWDOWN_PCT=10
 WOLF_MIN_VOLUME=5000000
 WOLF_MAX_RESULTS=3
 ```

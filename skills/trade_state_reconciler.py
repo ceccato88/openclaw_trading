@@ -2,22 +2,14 @@ from __future__ import annotations
 
 from hl_client import logger
 from skills.support import (
-    compute_protection_prices,
     delete_trade_state,
     get_active_protection_levels,
     get_open_position,
     list_trade_states,
+    round_price_for_order,
     save_trade_state,
     upsert_trade_protection,
 )
-
-
-def _infer_pct_from_levels(entry_price: float, target_price: float, is_long: bool) -> float:
-    if entry_price <= 0 or target_price <= 0:
-        return 0.0
-    if is_long:
-        return abs((target_price - entry_price) / entry_price) * 100
-    return abs((entry_price - target_price) / entry_price) * 100
 
 
 def reconcile_trade_states() -> dict:
@@ -67,14 +59,9 @@ def reconcile_trade_states() -> dict:
                     actions_taken.append({"coin": coin, "action": "trade_state_synced_to_exchange"})
                 continue
 
-            risk_pct = float(trade_state.get("risk_pct", 0.0) or 0.0)
-            reward_pct = float(trade_state.get("reward_pct", 0.0) or 0.0)
-            if risk_pct <= 0 and trade_state.get("sl") is not None:
-                risk_pct = _infer_pct_from_levels(entry_price, float(trade_state["sl"]), is_long)
-            if reward_pct <= 0 and trade_state.get("tp") is not None:
-                reward_pct = _infer_pct_from_levels(entry_price, float(trade_state["tp"]), is_long)
-
-            if risk_pct <= 0 or reward_pct <= 0:
+            stored_sl = trade_state.get("sl")
+            stored_tp = trade_state.get("tp")
+            if stored_sl is None or stored_tp is None:
                 had_partial_error = True
                 actions_taken.append(
                     {
@@ -86,27 +73,20 @@ def reconcile_trade_states() -> dict:
                 )
                 continue
 
-            protection_prices = compute_protection_prices(
-                coin=coin,
-                entry_price=entry_price,
-                risk_pct=risk_pct,
-                reward_pct=reward_pct,
-                is_long=is_long,
-            )
+            desired_sl = round_price_for_order(coin, float(stored_sl))
+            desired_tp = round_price_for_order(coin, float(stored_tp))
             protection = upsert_trade_protection(
                 coin,
                 is_long,
                 size,
-                protection_prices["sl"],
-                protection_prices["tp"],
+                desired_sl,
+                desired_tp,
                 active_protection=active_protection,
             )
             trade_state["entry"] = entry_price
             trade_state["size"] = size
             trade_state["sl"] = protection["sl"]["price"]
             trade_state["tp"] = protection["tp"]["price"]
-            trade_state["risk_pct"] = risk_pct
-            trade_state["reward_pct"] = reward_pct
             trade_state["status"] = "protected"
             trade_state.setdefault("management_stage", "initial_risk")
             save_trade_state(coin, trade_state)
