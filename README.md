@@ -9,5 +9,6 @@ Runtime local de trading para Hyperliquid com:
 
 Docs principais:
 
-- [OPENCLAW_SETUP.md](OPENCLAW_SETUP.md)
-- [DEBATE_ARENA_LOCAL.md](DEBATE_ARENA_LOCAL.md)
+- [OPENCLAW_SETUP.md](docs/OPENCLAW_SETUP.md)
+- [DEBATE_ARENA_LOCAL.md](docs/DEBATE_ARENA_LOCAL.md)
+- [BACKTEST.md](docs/BACKTEST.md)

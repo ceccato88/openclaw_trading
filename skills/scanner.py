@@ -60,10 +60,12 @@ def _score_candidate(
     entry = evaluate_pullback_entry_from_candles(
         scored["suggested_side"],
         candles[-40:],
+        coin=coin,
     )
     higher_timeframe_context = evaluate_higher_timeframe_context_from_candles(
         scored["suggested_side"],
         higher_timeframe_candles,
+        coin=coin,
     )
     entry.update({"coin": coin, "interval": "15m"})
     entry["higher_timeframe_context"] = higher_timeframe_context

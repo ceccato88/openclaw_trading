@@ -65,8 +65,8 @@ def _build_symbol_context(symbol: str, regime: Dict[str, Any], lookup: Dict[str,
     )
 
     suggested_side = scored.get("suggested_side", "LONG")
-    entry_setup = evaluate_pullback_entry_from_candles(suggested_side, candles_15m[-40:])
-    higher_timeframe_context = evaluate_higher_timeframe_context_from_candles(suggested_side, candles_1h)
+    entry_setup = evaluate_pullback_entry_from_candles(suggested_side, candles_15m[-40:], coin=symbol)
+    higher_timeframe_context = evaluate_higher_timeframe_context_from_candles(suggested_side, candles_1h, coin=symbol)
     entry_ready = bool(entry_setup.get("triggered")) and bool(higher_timeframe_context.get("context_ok"))
     if entry_setup.get("triggered") and not higher_timeframe_context.get("context_ok"):
         entry_setup = dict(entry_setup)

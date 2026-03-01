@@ -41,6 +41,32 @@ SCORE_WEIGHTS = {
     "divergence": 0.20,
 }
 _REGIME_CACHE: Dict[tuple[str, str, int], Dict[str, Any]] = {}
+BTC_FAMILY = {"BTC", "WBTC"}
+
+
+def coin_trade_profile(coin: str) -> Dict[str, float | int | str]:
+    normalized_coin = coin.upper()
+    if normalized_coin in BTC_FAMILY:
+        return {
+            "class": "btc",
+            "min_conviction": 0.25,
+            "max_entry_atr_pct": 0.018,
+            "level_buffer_pct": 0.0035,
+            "ema_gap_min_pct": 0.0025,
+            "ema200_buffer_pct": 0.0015,
+            "confirmation_window": 2,
+            "proximity_cap_pct": 0.012,
+        }
+    return {
+        "class": "alt",
+        "min_conviction": 0.35,
+        "max_entry_atr_pct": 0.014,
+        "level_buffer_pct": 0.006,
+        "ema_gap_min_pct": 0.005,
+        "ema200_buffer_pct": 0.003,
+        "confirmation_window": 3,
+        "proximity_cap_pct": 0.01,
+    }
 
 
 def now_ms() -> int:
@@ -354,31 +380,35 @@ def get_market_regime(coin: str = "BTC", interval: str = "1h", lookback: int = D
 def evaluate_pullback_entry_from_candles(
     direction: str,
     candles: Sequence[Dict[str, Any]],
+    coin: str = "BTC",
     proximity_threshold: Optional[float] = None,
     max_atr_pct: float = MAX_ENTRY_ATR_PCT,
 ) -> Dict[str, Any]:
     if len(candles) < 22:
         return {"triggered": False, "reason": "insufficient_candles"}
 
+    profile = coin_trade_profile(coin)
     closes = candle_closes(candles)
     opens = candle_opens(candles)
     ema21 = calculate_ema(closes, 21)[-1]
     current_price = closes[-1]
-    previous_close = closes[-2]
-    current_open = opens[-1]
-    previous_open = opens[-2]
     atr_pct = calculate_atr_pct(candles, period=14)
+    effective_max_atr_pct = min(max_atr_pct, float(profile["max_entry_atr_pct"]))
     if proximity_threshold is None:
-        proximity_threshold = clamp(max(atr_pct * 0.5, 0.003), 0.003, 0.02)
+        proximity_threshold = clamp(
+            max(atr_pct * 0.45, 0.0025),
+            0.0025,
+            float(profile["proximity_cap_pct"]),
+        )
 
-    if atr_pct > max_atr_pct:
+    if atr_pct > effective_max_atr_pct:
         return {
             "triggered": False,
             "reason": "atr_expansion_filter",
             "ema21": ema21,
             "current_price": current_price,
             "atr_pct": atr_pct * 100,
-            "max_atr_pct": max_atr_pct * 100,
+            "max_atr_pct": effective_max_atr_pct * 100,
             "proximity_threshold_pct": proximity_threshold * 100,
         }
 
@@ -386,18 +416,30 @@ def evaluate_pullback_entry_from_candles(
     near_ema = distance_pct <= proximity_threshold
 
     direction = direction.upper()
+    confirmation_window = int(profile["confirmation_window"])
+    if len(candles) < max(22, confirmation_window + 1):
+        return {"triggered": False, "reason": "insufficient_confirmation_window"}
+
+    recent_closes = closes[-confirmation_window:]
+    recent_opens = opens[-confirmation_window:]
+    closes_progressively = all(
+        recent_closes[idx] >= recent_closes[idx - 1] for idx in range(1, len(recent_closes))
+    )
+    closes_progressively_down = all(
+        recent_closes[idx] <= recent_closes[idx - 1] for idx in range(1, len(recent_closes))
+    )
     if direction == "LONG":
         confirmation = (
-            current_price > current_open
-            and previous_close > previous_open
-            and current_price >= previous_close
+            all(recent_closes[idx] > recent_opens[idx] for idx in range(len(recent_closes)))
+            and closes_progressively
+            and current_price >= ema21
         )
         limit_price = min(current_price, ema21)
     else:
         confirmation = (
-            current_price < current_open
-            and previous_close < previous_open
-            and current_price <= previous_close
+            all(recent_closes[idx] < recent_opens[idx] for idx in range(len(recent_closes)))
+            and closes_progressively_down
+            and current_price <= ema21
         )
         limit_price = max(current_price, ema21)
 
@@ -408,10 +450,10 @@ def evaluate_pullback_entry_from_candles(
         "ema21": ema21,
         "current_price": current_price,
         "atr_pct": atr_pct * 100,
-        "max_atr_pct": max_atr_pct * 100,
+        "max_atr_pct": effective_max_atr_pct * 100,
         "distance_to_ema_pct": distance_pct * 100,
         "confirmation_candle": confirmation,
-        "confirmation_window": 2,
+        "confirmation_window": confirmation_window,
         "entry_limit_price": limit_price,
         "proximity_threshold_pct": proximity_threshold * 100,
     }
@@ -420,12 +462,14 @@ def evaluate_pullback_entry_from_candles(
 def evaluate_higher_timeframe_context_from_candles(
     direction: str,
     candles: Sequence[Dict[str, Any]],
+    coin: str = "BTC",
     level_lookback: int = HIGHER_TIMEFRAME_LEVEL_LOOKBACK,
     level_buffer_pct: float = HIGHER_TIMEFRAME_LEVEL_BUFFER_PCT,
 ) -> Dict[str, Any]:
     if len(candles) < max(50, level_lookback + 1):
         return {"context_ok": False, "reason": "insufficient_higher_timeframe_candles"}
 
+    profile = coin_trade_profile(coin)
     closes = candle_closes(candles)
     highs = candle_highs(candles)
     lows = candle_lows(candles)
@@ -435,18 +479,32 @@ def evaluate_higher_timeframe_context_from_candles(
     recent_high = max(highs[-level_lookback:])
     recent_low = min(lows[-level_lookback:])
     direction = direction.upper()
+    ema_gap_pct = abs(ema50 - ema200) / ema200 if ema200 else 0.0
+    effective_level_buffer_pct = max(level_buffer_pct, float(profile["level_buffer_pct"]))
+    ema_gap_min_pct = float(profile["ema_gap_min_pct"])
+    ema200_buffer_pct = float(profile["ema200_buffer_pct"])
 
     if direction == "LONG":
-        trend_ok = current_price >= ema50 and ema50 >= ema200
+        trend_ok = (
+            current_price >= ema50
+            and ema50 >= ema200
+            and current_price >= (ema200 * (1 + ema200_buffer_pct))
+            and ema_gap_pct >= ema_gap_min_pct
+        )
         resistance_distance_pct = max((recent_high - current_price) / current_price, 0.0) if current_price else 0.0
-        level_ok = resistance_distance_pct > level_buffer_pct
+        level_ok = resistance_distance_pct > effective_level_buffer_pct
         reason = "ok" if trend_ok and level_ok else "higher_timeframe_trend_filter" if not trend_ok else "near_higher_timeframe_resistance"
         nearest_level_distance_pct = resistance_distance_pct * 100
         nearest_level = recent_high
     else:
-        trend_ok = current_price <= ema50 and ema50 <= ema200
+        trend_ok = (
+            current_price <= ema50
+            and ema50 <= ema200
+            and current_price <= (ema200 * (1 - ema200_buffer_pct))
+            and ema_gap_pct >= ema_gap_min_pct
+        )
         support_distance_pct = max((current_price - recent_low) / current_price, 0.0) if current_price else 0.0
-        level_ok = support_distance_pct > level_buffer_pct
+        level_ok = support_distance_pct > effective_level_buffer_pct
         reason = "ok" if trend_ok and level_ok else "higher_timeframe_trend_filter" if not trend_ok else "near_higher_timeframe_support"
         nearest_level_distance_pct = support_distance_pct * 100
         nearest_level = recent_low
@@ -458,11 +516,14 @@ def evaluate_higher_timeframe_context_from_candles(
         "current_price": current_price,
         "ema50": ema50,
         "ema200": ema200,
+        "ema_gap_pct": ema_gap_pct * 100,
+        "ema_gap_min_pct": ema_gap_min_pct * 100,
+        "ema200_buffer_pct": ema200_buffer_pct * 100,
         "trend_ok": trend_ok,
         "level_ok": level_ok,
         "nearest_level": nearest_level,
         "nearest_level_distance_pct": nearest_level_distance_pct,
-        "level_buffer_pct": level_buffer_pct * 100,
+        "level_buffer_pct": effective_level_buffer_pct * 100,
         "level_lookback_candles": level_lookback,
     }
 
@@ -479,11 +540,12 @@ def evaluate_pullback_entry(
     result = evaluate_pullback_entry_from_candles(
         direction,
         candles,
+        coin=coin,
         proximity_threshold=proximity_threshold,
         max_atr_pct=max_atr_pct,
     )
     higher_timeframe_candles = fetch_candles(coin, interval="1h", lookback=max(120, HIGHER_TIMEFRAME_LEVEL_LOOKBACK + 10))
-    context = evaluate_higher_timeframe_context_from_candles(direction, higher_timeframe_candles)
+    context = evaluate_higher_timeframe_context_from_candles(direction, higher_timeframe_candles, coin=coin)
     result["higher_timeframe_context"] = context
     result["triggered"] = bool(result.get("triggered")) and bool(context.get("context_ok"))
     if result["triggered"]:
@@ -538,6 +600,7 @@ def score_opportunity(
     prev_day_px: float,
     regime: str,
 ) -> Dict[str, Any]:
+    profile = coin_trade_profile(coin)
     closes = candle_closes(candles)
     highs = candle_highs(candles)
     lows = candle_lows(candles)
@@ -567,9 +630,11 @@ def score_opportunity(
         + (divergence["bias"] * SCORE_WEIGHTS["divergence"])
     )
 
-    if regime == "BULL" and directional_score < MIN_DIRECTIONAL_CONVICTION:
+    effective_min_conviction = max(MIN_DIRECTIONAL_CONVICTION, float(profile["min_conviction"]))
+
+    if regime == "BULL" and directional_score < effective_min_conviction:
         return {"coin": coin, "rejected": True, "reason": "regime_filter_bull_weak_signal"}
-    if regime == "BEAR" and directional_score > -MIN_DIRECTIONAL_CONVICTION:
+    if regime == "BEAR" and directional_score > -effective_min_conviction:
         return {"coin": coin, "rejected": True, "reason": "regime_filter_bear_weak_signal"}
     if regime == "CHOP":
         return {"coin": coin, "rejected": True, "reason": "regime_filter_chop"}
@@ -589,7 +654,8 @@ def score_opportunity(
         "score_strength": round(score_strength, 2),
         "rating": rating,
         "directional_score": round(directional_score, 4),
-        "min_conviction": MIN_DIRECTIONAL_CONVICTION,
+        "min_conviction": effective_min_conviction,
+        "asset_class": str(profile["class"]),
         "atr_pct": round(atr_pct * 100, 4),
         "min_atr_pct": MIN_SIGNAL_ATR_PCT * 100,
         "atr_quality": round(atr_quality, 4),
