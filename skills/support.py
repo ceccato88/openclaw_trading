@@ -96,7 +96,20 @@ def acquire_file_lock(lock_name: str) -> Optional[Path]:
     lock_path = lock_file_path(lock_name)
     if lock_path.exists():
         lock_age_seconds = time.time() - lock_path.stat().st_mtime
-        if lock_age_seconds > LOCK_STALE_SECONDS:
+        should_remove_stale = lock_age_seconds > LOCK_STALE_SECONDS
+        if not should_remove_stale:
+            try:
+                lock_pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+            except Exception:  # noqa: BLE001
+                lock_pid = 0
+            if lock_pid > 0:
+                try:
+                    os.kill(lock_pid, 0)
+                except ProcessLookupError:
+                    should_remove_stale = True
+                except PermissionError:
+                    should_remove_stale = False
+        if should_remove_stale:
             logger.warning(f"Lock stale detetado em {lock_path.name}; a remover lock antigo.")
             lock_path.unlink(missing_ok=True)
     try:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a real end-to-end smoke test against Hyperliquid testnet without Agno."""
+"""Run a real end-to-end smoke test against Hyperliquid testnet."""
 
 from __future__ import annotations
 

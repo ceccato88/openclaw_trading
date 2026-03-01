@@ -1,6 +1,6 @@
 # OpenClaw Setup
 
-Este pacote `openclaw/` roda o bot sem Agno, chamando apenas Python local.
+Este pacote `openclaw/` roda o bot apenas Python local.
 
 ## Arquivos principais
 
@@ -93,7 +93,7 @@ python scripts/openclaw_scheduler.py --heartbeat-once
 python scripts/openclaw_scheduler.py --hunt-once
 ```
 
-## Smoke test completo sem Agno
+## Smoke test completo 
 
 O smoke test real está em:
 
